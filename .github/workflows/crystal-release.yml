@@ -75,18 +75,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Crystal and cmake
-        run: brew install crystal cmake
+      - name: Install Crystal, cmake, and OpenSSL
+        run: brew install crystal cmake openssl@3 pkg-config
 
       - name: Build release binary
         run: |
           shards install
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig"
           crystal build src/cli_main.cr -o deadfinder --release --no-debug
 
       - name: Package
         run: |
-          chmod +x deadfinder
-          tar czf deadfinder-macos-${{ matrix.arch }}.tar.gz deadfinder
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh deadfinder "deadfinder-macos-${{ matrix.arch }}.tar.gz" deadfinder
           shasum -a 256 deadfinder-macos-${{ matrix.arch }}.tar.gz > deadfinder-macos-${{ matrix.arch }}.tar.gz.sha256
 
       - name: Upload to release
