@@ -4,6 +4,9 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Fixed
+- macOS release tarballs now bundle Homebrew-linked runtime libraries (OpenSSL, libyaml, pcre2, bdw-gc) next to the binary so direct-download installs work without a local Homebrew dependency tree.
+
 ### Changed
 - Multi-target scans (`pipe`/`file`/`sitemap`) now attribute a shared broken link to **every** page that references it, not just the first page scanned, and per-target coverage counts each page's own links. Internally the global "already-seen" URL set became a URL→status cache, so each link is still fetched at most once. Previously a 404 referenced by pages A and B was reported only under A and skewed B's coverage.
 
