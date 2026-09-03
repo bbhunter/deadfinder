@@ -17,14 +17,21 @@ module Deadfinder
         parser.separator "  file <FILE>                 Scan the URLs from File (`-` for STDIN)"
         parser.separator "  url <URL>                   Scan the Single URL"
         parser.separator "  sitemap <SITEMAP-URL>       Scan the URLs from sitemap"
-        parser.separator "  completion <SHELL>           Generate completion script (bash/zsh/fish)"
+        parser.separator "  completion <SHELL>          Generate completion script (bash/zsh/fish)"
         parser.separator "  version                     Show version"
         parser.separator ""
         parser.separator "Options:"
 
         parser.on("-r", "--include30x", "Include 30x redirections") { options.include30x = true }
         parser.on("-c CONCURRENCY", "--concurrency=CONCURRENCY", "Number of concurrency (default: 50)") { |v| options.concurrency = v.to_i }
+        parser.on("--target-concurrency=N", "Number of targets scanned in parallel; total in-flight requests stay capped at -c (default: 10)") { |v| options.target_concurrency = v.to_i }
         parser.on("-t TIMEOUT", "--timeout=TIMEOUT", "Timeout in seconds (default: 10)") { |v| options.timeout = v.to_i }
+        parser.on("--method=METHOD", "Link check method: auto, head, get (default: auto). auto sends HEAD first and re-checks with GET on any 4xx/5xx (405/501 included), so no link is reported dead on a HEAD status alone. A HEAD that never reached the host is not re-checked") { |v| options.http_method = v.strip.downcase }
+        parser.on("--retry=N", "Retry a transient failure N times: connection error, timeout, 429 or 5xx. A 404 is never retried (default: 2)") { |v| options.retries = v.to_i }
+        parser.on("--delay=MS", "Minimum milliseconds between two requests to the same host; other hosts are unaffected (default: 0)") { |v| options.delay = v.to_i }
+        parser.on("--accept-status=LIST", "Treat these statuses as alive, e.g. '200,204,403,999' or '400-499'. Wins over --dead-status and over the built-in >= 400 rule") { |v| options.accept_status = v }
+        parser.on("--dead-status=LIST", "Treat these statuses as dead, e.g. '500-599'. Applied after --accept-status and before the built-in rule") { |v| options.dead_status = v }
+        parser.on("--exclude-status=LIST", "Alias of --dead-status") { |v| options.dead_status = v }
         parser.on("-o OUTPUT", "--output=OUTPUT", "File to write result") { |v| options.output = v }
         parser.on("-f FORMAT", "--output_format=FORMAT", "Output format: json, yaml, toml, csv, sarif (default: json)") { |v| options.output_format = v }
         parser.on("-H HEADER", "--headers=HEADER", "Custom HTTP headers for initial request") { |v| options.headers << v }
@@ -39,7 +46,12 @@ module Deadfinder
         parser.on("-v", "--verbose", "Verbose mode") { options.verbose = true }
         parser.on("--debug", "Debug mode") { options.debug = true }
         parser.on("--limit=N", "Limit number of URLs to scan") { |v| options.limit = v.to_i }
+        parser.on("--check-anchors", "Verify #fragment targets exist in the linked document") { options.check_anchors = true }
         parser.on("--coverage", "Enable coverage tracking and reporting") { options.coverage = true }
+        # The literal 2 is `Deadfinder::EXIT_DEAD_FOUND`. Spelled out rather than
+        # interpolated so `Completion::FLAGS` can mirror this line verbatim and its
+        # drift spec stays an exact comparison.
+        parser.on("-F", "--fail-on-dead", "Exit with code 2 when any dead link or dead target is found (default: always exit 0)") { options.fail_on_dead = true }
         parser.on("--visualize=PATH", "Generate visualization PNG") { |v| options.visualize = v }
         parser.on("-h", "--help", "Show help") do
           puts parser
@@ -84,12 +96,28 @@ module Deadfinder
           STDERR.puts "Error: concurrency must be >= 1 (got #{options.concurrency})"
           exit 1
         end
+        if options.target_concurrency < 1
+          STDERR.puts "Error: target concurrency must be >= 1 (got #{options.target_concurrency})"
+          exit 1
+        end
         if options.timeout < 1
           STDERR.puts "Error: timeout must be >= 1 (got #{options.timeout})"
           exit 1
         end
         if options.limit < 0
           STDERR.puts "Error: limit must be >= 0 (got #{options.limit})"
+          exit 1
+        end
+        if options.retries < 0
+          STDERR.puts "Error: retry must be >= 0 (got #{options.retries})"
+          exit 1
+        end
+        if options.delay < 0
+          STDERR.puts "Error: delay must be >= 0 (got #{options.delay})"
+          exit 1
+        end
+        unless HttpClient::METHODS.includes?(options.http_method)
+          STDERR.puts "Error: unsupported method: #{options.http_method} (allowed: #{HttpClient::METHODS.join(", ")})"
           exit 1
         end
         allowed_formats = ["json", "yaml", "yml", "csv", "toml", "sarif"]
@@ -107,6 +135,7 @@ module Deadfinder
       case subcommand
       when "pipe"
         Deadfinder.run_pipe(options)
+        exit_on_findings(options)
       when "file"
         if positional_arg
           filename = positional_arg.not_nil!
@@ -126,6 +155,7 @@ module Deadfinder
             end
           end
           Deadfinder.run_file(filename, options)
+          exit_on_findings(options)
         else
           STDERR.puts "Error: file command requires a filename argument"
           STDERR.puts "Usage: deadfinder file <FILE> [options]  (use `-` to read from STDIN)"
@@ -139,6 +169,7 @@ module Deadfinder
             exit 1
           end
           Deadfinder.run_url(target, options)
+          exit_on_findings(options)
         else
           STDERR.puts "Error: url command requires a URL argument"
           STDERR.puts "Usage: deadfinder url <URL> [options]"
@@ -152,6 +183,7 @@ module Deadfinder
             exit 1
           end
           Deadfinder.run_sitemap(target, options)
+          exit_on_findings(options)
         else
           STDERR.puts "Error: sitemap command requires a URL argument"
           STDERR.puts "Usage: deadfinder sitemap <SITEMAP-URL> [options]"
@@ -182,6 +214,15 @@ module Deadfinder
         puts global_parser
         exit 1 if subcommand
       end
+    end
+
+    # `--fail-on-dead` turns a completed scan that found something into a
+    # non-zero exit so a CI job can gate on it. Opt-in only: the frozen v1
+    # contract is that every scan exits 0, and `spec/compat/run.rb` asserts it.
+    # Exit 1 stays reserved for usage/IO errors, so findings get their own code.
+    private def self.exit_on_findings(options : Options) : Nil
+      return unless options.fail_on_dead
+      exit Deadfinder::EXIT_DEAD_FOUND if Deadfinder.dead_findings?
     end
   end
 end
